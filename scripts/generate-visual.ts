@@ -1,0 +1,1139 @@
+#!/usr/bin/env tsx
+/**
+ * Genereert een standalone HTML-landkaart.
+ * Layout: 60% landkaart links, 40% detail rechts (sticky).
+ * Werkt zonder build-step: React + Tailwind via CDN, data embedded.
+ */
+import { writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { loadLandkaart } from './lib/loader.ts';
+import type { Landkaart } from './lib/schema.ts';
+
+interface ProjectConfig {
+  klant_naam: string;
+  project_naam: string;
+  document_eigenaar: string;
+}
+
+function laadProjectConfig(): ProjectConfig {
+  try {
+    return JSON.parse(readFileSync('project.config.json', 'utf8')) as ProjectConfig;
+  } catch {
+    throw new Error('project.config.json niet gevonden — kopieer het bestand en vul de klantgegevens in.');
+  }
+}
+
+function laadWorkatoState(): unknown | null {
+  const path = join('output', 'workato-state.json');
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function genereerHtml(lk: Landkaart): string {
+  const workatoState = laadWorkatoState();
+  const config = laadProjectConfig();
+  const data = JSON.stringify({ ...lk, workato: workatoState }).replace(/</g, '\\u003c');
+  const topicCount = lk.apis.reduce((n, a) => n + a.topics.length, 0);
+
+  return `<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Integratie-landkaart · ${config.klant_naam} · v${lk.metadata.versie}</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    /* Surface tonen — oplopend van canvas naar elevated */
+    --bg-canvas: #0a1a2e;         /* linker landkaart-kant */
+    --bg-panel: #061324;          /* rechter detail-paneel (donkerder) */
+    --bg-header: #08172a;
+    --bg-card: #122e4a;           /* kaarten op canvas */
+    --bg-card-hover: #1a3a5a;
+
+    /* Accenten */
+    --orange: #ffce3c;
+    --orange-dim: rgba(255,206,60,0.18);
+
+    /* Neutralen — als rgba witwaarden voor consistente dark tones */
+    --text: #f5f7fa;              /* primary text */
+    --text-muted: rgba(255,255,255,0.65);
+    --text-dim: rgba(255,255,255,0.45);
+    --border: rgba(255,255,255,0.1);
+    --border-strong: rgba(255,255,255,0.22);
+
+    /* Compat: --navy hergebruikt als "primary heading/accent" — in dark is dat bijna-wit */
+    --navy: #f5f7fa;
+    --gray-900: #f5f7fa;
+    --gray-800: rgba(255,255,255,0.9);
+    --gray-700: rgba(255,255,255,0.8);
+    --gray-600: rgba(255,255,255,0.65);
+    --gray-500: rgba(255,255,255,0.5);
+    --gray-400: rgba(255,255,255,0.35);
+    --gray-300: rgba(255,255,255,0.22);
+    --gray-200: rgba(255,255,255,0.12);
+    --gray-100: rgba(255,255,255,0.08);
+    --gray-50: rgba(255,255,255,0.04);
+    --orange-light: rgba(255,206,60,0.18);
+  }
+  html, body { font-family: 'Inter', -apple-system, 'Helvetica Neue', sans-serif; background: var(--bg-canvas); color: var(--text); }
+  .font-mono { font-family: 'JetBrains Mono', monospace; }
+
+  .eyebrow { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--text-dim); }
+
+  .card { background: var(--bg-card); border: 1px solid var(--border); transition: all 0.2s ease; color: var(--text); }
+  .card:hover { border-color: var(--border-strong); background: var(--bg-card-hover); }
+
+  .api-card { cursor: pointer; }
+  .api-card.selected { border-color: var(--orange); border-width: 2px; }
+  .api-card.selected .api-label { color: var(--orange); }
+  .api-header { background: var(--bg-card); transition: background 0.15s ease; }
+  .api-card.api-only .api-header { background: var(--orange-dim); }
+
+  .topics-list { background: var(--bg-canvas); padding: 10px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 6px; }
+  .topic-row { cursor: pointer; transition: all 0.15s ease; background: var(--bg-card); border: 1px solid var(--border); border-left: 3px solid var(--border-strong); padding: 8px 10px; }
+  .topic-row:hover { border-color: var(--border-strong); background: var(--bg-card-hover); }
+  .topic-row.selected { background: var(--orange-dim); border-color: var(--orange); border-left-color: var(--orange); }
+
+  .arrow { color: var(--text-dim); }
+  .arrow.active { color: var(--orange); }
+
+  button { cursor: pointer; }
+  button:focus { outline: 2px solid var(--orange); outline-offset: 2px; }
+
+  /* Tailwind-class overrides zodat JSX bg-white/text-gray-X/border-gray-X darkmode volgt */
+  .bg-white { background: var(--bg-header) !important; }
+  .bg-gray-50 { background: var(--gray-50) !important; }
+  .bg-gray-100 { background: var(--gray-100) !important; }
+  .bg-orange-50 { background: var(--orange-dim) !important; }
+  .text-orange-700 { color: var(--orange) !important; }
+  .border-orange-200 { border-color: var(--orange) !important; }
+  .text-gray-300 { color: rgba(255,255,255,0.22) !important; }
+  .text-gray-400 { color: var(--text-dim) !important; }
+  .text-gray-500 { color: var(--text-dim) !important; }
+  .text-gray-600 { color: var(--text-muted) !important; }
+  .text-gray-700 { color: var(--gray-700) !important; }
+  .text-gray-800 { color: var(--gray-800) !important; }
+  .border-gray-100 { border-color: var(--border) !important; }
+  .border-gray-200 { border-color: var(--border) !important; }
+  .border-gray-300 { border-color: var(--border-strong) !important; }
+
+  .sticky-detail { position: sticky; top: 0; max-height: 100vh; overflow: auto; }
+  .sticky-detail::-webkit-scrollbar { width: 6px; height: 6px; }
+  .sticky-detail::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 3px; }
+
+  /* Popout overlay voor CDM-tabel — fullscreen modal */
+  .popout-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 50; display: flex; align-items: center; justify-content: center; padding: 2rem; backdrop-filter: blur(4px); }
+  .popout-panel { background: var(--bg-panel); border: 1px solid var(--border); width: 100%; max-width: 1400px; max-height: 90vh; overflow: auto; padding: 2rem; position: relative; }
+  .popout-panel::-webkit-scrollbar { width: 8px; height: 8px; }
+  .popout-panel::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.25); border-radius: 4px; }
+  .popout-close { position: absolute; top: 1rem; right: 1rem; background: transparent; border: 1px solid var(--border); color: var(--text); padding: 0.35rem 0.7rem; font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.15em; text-transform: uppercase; }
+  .popout-close:hover { background: var(--gray-100); border-color: var(--border-strong); }
+  .popout-trigger { background: transparent; border: 1px solid var(--border); color: var(--text-muted); padding: 0.3rem 0.6rem; font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.15em; text-transform: uppercase; }
+  .popout-trigger:hover { border-color: var(--orange); color: var(--orange); }
+
+  /* CDM treeview (compact, in detail-pane) */
+  .cdm-tree { font-size: 13px; }
+  .tree-row { display: flex; align-items: center; gap: 8px; padding: 5px 4px; border-bottom: 1px solid var(--border); }
+  .tree-row.expandable { cursor: pointer; }
+  .tree-row.expandable:hover { background: var(--gray-100); }
+  .tree-chev { display: inline-block; width: 12px; color: var(--orange); font-size: 10px; flex-shrink: 0; text-align: center; }
+  .tree-chev.empty { color: transparent; }
+  .tree-row { position: relative; }
+  .tree-tooltip { position: fixed; z-index: 100; width: 340px; max-width: calc(100vw - 40px); background: var(--bg-canvas); border: 1px solid var(--orange); padding: 12px 14px; box-shadow: 0 8px 24px rgba(0,0,0,0.55); pointer-events: none; }
+
+  /* CDM tabel zebra-striping (popout) */
+  .cdm-row-alt > td { background: rgba(255,255,255,0.03); }
+
+  /* Split layout — linkerpane minimum 40% zodat de landkaart leesbaar blijft */
+  .split { display: grid; grid-template-columns: minmax(40%, 3fr) minmax(0, 2fr); min-height: calc(100vh - 84px); }
+  .pane-left { background: var(--bg-canvas); padding: 2rem; min-width: 0; }
+  .pane-right { background: var(--bg-panel); padding: 2.5rem 2rem; border-left: 1px solid var(--border); min-width: 0; }
+
+  /* Connectors — SVG overlay voor bron→topic→consumer lijnen */
+  .landkaart-area { position: relative; }
+  .connectors { position: absolute; inset: 0; pointer-events: none; z-index: 2; overflow: visible; }
+  .connectors path { fill: none; stroke: rgba(255,255,255,0.18); stroke-width: 1.5; stroke-linecap: round; }
+  .connectors path.highlight { stroke-width: 2.5; opacity: 1; filter: drop-shadow(0 0 4px currentColor); }
+
+  @media print {
+    .no-print { display: none; }
+    .sticky-detail { position: static; max-height: none; }
+    .split { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="application/json" id="landkaart-data">${data}</script>
+<script type="text/babel" data-type="module">
+const { useState, useMemo, useRef, useLayoutEffect, useCallback, useEffect } = React;
+
+const LANDKAART = JSON.parse(document.getElementById('landkaart-data').textContent);
+
+function Header() {
+  return (
+    <header className="border-b border-gray-200 bg-white">
+      <div className="px-8 py-6 flex items-center justify-between">
+        <div>
+          <div className="eyebrow mb-2">${config.klant_naam} · ${config.project_naam}</div>
+          <h1 className="text-3xl font-semibold tracking-tight" style={{ color: 'var(--navy)' }}>
+            Integratie<span style={{ color: 'var(--orange)' }}>·</span>landkaart
+          </h1>
+        </div>
+        <div className="text-right">
+          <div className="eyebrow mb-1">v{LANDKAART.metadata.versie} · {LANDKAART.metadata.datum}</div>
+          <div className="text-sm text-gray-600">
+            {LANDKAART.apis.length} API's · ${topicCount} topics · {Object.keys(LANDKAART.systemen).length} systemen
+          </div>
+        </div>
+      </div>
+    </header>
+  );
+}
+
+function curvedPath(a, b) {
+  const dx = Math.max(40, Math.abs(b.x - a.x) * 0.55);
+  return \`M \${a.x} \${a.y} C \${a.x + dx} \${a.y}, \${b.x - dx} \${b.y}, \${b.x} \${b.y}\`;
+}
+
+function Connectors({ containerRef, topics, selectedTopicId, systemen }) {
+  const [paths, setPaths] = useState([]);
+
+  const recompute = useCallback(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const cr = container.getBoundingClientRect();
+    const out = [];
+    for (const topic of topics) {
+      const topicEl = container.querySelector(\`[data-topic-id="\${topic.id}"]\`);
+      if (!topicEl) continue;
+      const tr = topicEl.getBoundingClientRect();
+      const topicLeft = { x: tr.left - cr.left, y: tr.top - cr.top + tr.height / 2 };
+      const topicRight = { x: tr.right - cr.left, y: tr.top - cr.top + tr.height / 2 };
+      const highlight = selectedTopicId && selectedTopicId === topic.id;
+
+      for (const b of topic.bron) {
+        const bronEl = container.querySelector(\`[data-syscard="\${b}"][data-column="bron"]\`);
+        if (!bronEl) continue;
+        const br = bronEl.getBoundingClientRect();
+        const from = { x: br.right - cr.left, y: br.top - cr.top + br.height / 2 };
+        out.push({ d: curvedPath(from, topicLeft), highlight, color: highlight ? systemen[b]?.kleur : null });
+      }
+      for (const c of topic.consumers) {
+        const el = container.querySelector(\`[data-syscard="\${c}"][data-column="consumer"]\`);
+        if (!el) continue;
+        const er = el.getBoundingClientRect();
+        const to = { x: er.left - cr.left, y: er.top - cr.top + er.height / 2 };
+        out.push({ d: curvedPath(topicRight, to), highlight, color: highlight ? systemen[c]?.kleur : null });
+      }
+    }
+    setPaths(out);
+  }, [containerRef, topics, selectedTopicId, systemen]);
+
+  useLayoutEffect(() => { recompute(); }, [recompute]);
+  useEffect(() => {
+    const handler = () => recompute();
+    window.addEventListener('resize', handler);
+    const container = containerRef.current;
+    let ro;
+    if (container && typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(handler);
+      ro.observe(container);
+    }
+    return () => {
+      window.removeEventListener('resize', handler);
+      if (ro) ro.disconnect();
+    };
+  }, [recompute, containerRef]);
+
+  return (
+    <svg className="connectors" width="100%" height="100%">
+      {paths.map((p, i) => (
+        <path
+          key={i}
+          d={p.d}
+          className={p.highlight ? 'highlight' : ''}
+          style={p.color ? { stroke: p.color, color: p.color } : undefined}
+        />
+      ))}
+    </svg>
+  );
+}
+
+function StatusPill({ status }) {
+  const map = {
+    placeholder: { label: 'Placeholder', bg: 'rgba(255,255,255,0.12)', color: 'rgba(255,255,255,0.6)', dot: 'rgba(255,255,255,0.4)' },
+    concept:     { label: 'Concept',     bg: 'rgba(255,206,60,0.2)',   color: 'var(--orange)',          dot: 'var(--orange)' },
+    live:        { label: 'Live',        bg: 'rgba(34,197,94,0.18)',   color: '#4ade80',                dot: '#22c55e' },
+  };
+  const s = map[status] ?? map.placeholder;
+  return (
+    <span className="inline-flex items-center gap-1.5 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider" style={{ background: s.bg, color: s.color }}>
+      <span style={{ width: 6, height: 6, borderRadius: '50%', background: s.dot, display: 'inline-block' }}></span>
+      {s.label}
+    </span>
+  );
+}
+
+function StatusDot({ status }) {
+  const map = {
+    placeholder: 'rgba(255,255,255,0.35)',
+    concept:     'var(--orange)',
+    live:        '#22c55e',
+  };
+  return <span style={{ width: 7, height: 7, borderRadius: '50%', background: map[status] ?? map.placeholder, display: 'inline-block', flexShrink: 0 }} title={status} />;
+}
+
+function SysteemLabel({ systeem, className, style }) {
+  if (!systeem) return null;
+  return (
+    <span className={\`inline-flex items-center gap-1.5 \${className ?? ''}\`} style={style}>
+      {systeem.logo && (
+        <img
+          src={systeem.logo}
+          alt=""
+          style={{ width: 14, height: 14, flexShrink: 0, opacity: 0.85, display: 'inline-block' }}
+          onError={(e) => { e.currentTarget.style.display = 'none'; }}
+        />
+      )}
+      <span>{systeem.naam}</span>
+    </span>
+  );
+}
+
+function vindSysteemOpNaam(systemen, naam) {
+  if (!naam || !systemen) return null;
+  const target = naam.toLowerCase();
+  const lijst = Object.values(systemen);
+  const exact = lijst.find((s) => s.naam.toLowerCase() === target);
+  if (exact) return exact;
+  return lijst.find((s) => s.naam.toLowerCase().startsWith(target) || target.startsWith(s.naam.toLowerCase())) ?? null;
+}
+
+function EigenaarPill({ eigenaar, systemen }) {
+  if (!eigenaar) return null;
+  const sys = vindSysteemOpNaam(systemen, eigenaar);
+  const merk = sys?.kleur;
+  if (!merk) {
+    return <span className="inline-block px-2 py-0.5 text-[11px] font-mono border bg-orange-50 text-orange-700 border-orange-200">{eigenaar}</span>;
+  }
+  return (
+    <span className="inline-block px-2 py-0.5 text-[11px] font-mono border" style={{ background: merk, color: '#fff', borderColor: merk }}>
+      {eigenaar}
+    </span>
+  );
+}
+
+function Pill({ children, variant = 'default' }) {
+  const variants = {
+    default: 'bg-gray-100 text-gray-700 border-gray-200',
+    orange: 'bg-orange-50 text-orange-700 border-orange-200',
+    navy: 'text-white border-transparent',
+  };
+  const style = variant === 'navy' ? { background: 'var(--navy)' } : {};
+  return (
+    <span className={\`inline-block px-2 py-0.5 text-[11px] font-mono border \${variants[variant] ?? variants.default}\`} style={style}>
+      {children}
+    </span>
+  );
+}
+
+function SysteemCard({ systeem, active, dashed, column }) {
+  const merk = systeem.kleur ?? 'var(--border-strong)';
+  const base = dashed
+    ? { background: 'transparent', borderStyle: 'dashed', borderColor: 'var(--border-strong)', opacity: 0.65, borderLeft: \`4px dashed \${merk}\` }
+    : { borderLeft: \`4px solid \${merk}\` };
+  const activeStyle = active
+    ? { background: merk, color: '#fff', borderColor: merk }
+    : {};
+  const style = { ...base, ...activeStyle };
+  const logoBg = active ? 'rgba(255,255,255,0.18)' : merk;
+  return (
+    <div className="card p-3 border" style={style} data-syscard={systeem.id} data-column={column}>
+      <div className="flex items-start gap-2">
+        <div
+          className="flex-shrink-0 flex items-center justify-center"
+          style={{ width: 28, height: 28, background: logoBg, borderRadius: 4 }}
+        >
+          {systeem.logo
+            ? <img src={systeem.logo} alt="" style={{ width: 16, height: 16, display: 'block' }} />
+            : <span style={{ width: 8, height: 8, borderRadius: '50%', background: active ? '#fff' : 'rgba(255,255,255,0.85)' }} />
+          }
+        </div>
+        <div className="min-w-0">
+          <div className="eyebrow" style={{ color: active ? 'rgba(255,255,255,0.75)' : undefined }}>{systeem.rol}</div>
+          <div className="font-semibold text-sm mt-0.5" style={{ color: active ? '#fff' : 'var(--text)' }}>{systeem.naam}</div>
+          <div className="text-[11px] mt-1 leading-snug" style={{ color: active ? 'rgba(255,255,255,0.85)' : 'var(--text-muted)' }}>
+            {systeem.beschrijving}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BronnenKolom({ systemen, bronIds, dataLeveranciers, activeBronnen }) {
+  return (
+    <div>
+      <div className="eyebrow mb-3">01 · Bronsystemen</div>
+      <div className="space-y-2">
+        {bronIds.map((id) => (
+          <SysteemCard key={id} systeem={systemen[id]} active={activeBronnen.has(id)} column="bron" />
+        ))}
+        {dataLeveranciers.map((s) => (
+          <SysteemCard key={s.id} systeem={s} dashed column="bron" />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ConsumersKolom({ systemen, consumerIds, activeConsumers }) {
+  return (
+    <div>
+      <div className="eyebrow mb-3">03 · Consumers</div>
+      <div className="space-y-2">
+        {consumerIds.map((id) => (
+          <SysteemCard key={id} systeem={systemen[id]} active={activeConsumers.has(id)} column="consumer" />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function TopicsKolom({ apis, systemen, selectedApi, selectedTopic, onSelectApi, onSelectTopic }) {
+  return (
+    <div>
+      <div className="eyebrow mb-3">02 · Topics in Workato</div>
+      <div className="space-y-3">
+        {apis.map((api) => {
+          const isSelected = selectedApi?.id === api.id;
+          const isApiOnly = isSelected && !selectedTopic;
+          return (
+            <div key={api.id}
+                 className={\`api-card card \${isSelected ? 'selected' : ''} \${isApiOnly ? 'api-only' : ''}\`}
+                 onClick={() => onSelectApi(api)}>
+              <div className="api-header px-3 py-2.5 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <StatusDot status={api.status} />
+                  <div className="api-label font-semibold text-sm" style={{ color: 'var(--navy)' }}>{api.label} API</div>
+                  <span className="eyebrow ml-1" style={{ color: 'var(--orange)' }}>CDM</span>
+                </div>
+                <div className="eyebrow">{api.topics.length} {api.topics.length === 1 ? 'topic' : 'topics'}</div>
+              </div>
+              <div className="topics-list">
+                {api.topics.map((t) => {
+                  const isTopicSelected = selectedTopic?.id === t.id;
+                  return (
+                    <div key={t.id}
+                         data-topic-id={t.id}
+                         className={\`topic-row \${isTopicSelected ? 'selected' : ''}\`}
+                         onClick={(e) => { e.stopPropagation(); onSelectTopic(api, t); }}>
+                      <div className="flex items-center gap-2">
+                        <StatusDot status={t.status} />
+                        <div className="text-sm font-medium" style={{ color: 'var(--navy)' }}>{t.naam}</div>
+                      </div>
+                      {t.beschrijving && (
+                        <div className="text-xs text-gray-500 mt-1 leading-snug pl-[15px]">{t.beschrijving}</div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function findSubObject(subObjecten, type) {
+  if (!type) return null;
+  const m = type.match(/^(?:object|array)<(.+)>$/);
+  if (!m) return null;
+  const name = m[1].trim().toLowerCase();
+  return subObjecten.find((s) => s.naam.toLowerCase() === name) || null;
+}
+
+/** Sub-objecten die door geen enkel veld gerefereerd worden (orphan secties). */
+function findOrphanSubObjects(velden, subObjecten) {
+  const referenced = new Set();
+  const collect = (lijst) => {
+    for (const v of lijst) {
+      const sub = findSubObject(subObjecten, v.type);
+      if (sub) {
+        referenced.add(sub.naam.toLowerCase());
+        collect(sub.velden);
+      }
+    }
+  };
+  collect(velden);
+  return subObjecten.filter((s) => !referenced.has(s.naam.toLowerCase()));
+}
+
+function CdmFieldTooltip({ veld, systemen, position }) {
+  const mappingEntries = Object.entries(veld.mapping || {});
+  const style = position ? { top: position.top, left: position.left } : {};
+  return (
+    <div className="tree-tooltip" style={style}>
+      <div className="flex items-baseline gap-2 mb-1">
+        <span className="font-mono text-xs" style={{ color: 'var(--orange)' }}>{veld.naam}</span>
+        <span className="font-mono text-[10px] text-gray-500">{veld.type}</span>
+        {veld.verplicht && <span className="text-[10px]" style={{ color: 'var(--orange)' }}>· verplicht</span>}
+      </div>
+      {veld.eigenaar && (
+        <div className="mb-2"><EigenaarPill eigenaar={veld.eigenaar} systemen={systemen} /></div>
+      )}
+      {veld.beschrijving && (
+        <p className="text-[11px] leading-snug mb-2" style={{ color: 'rgba(255,255,255,0.85)' }}>{veld.beschrijving}</p>
+      )}
+      {mappingEntries.length > 0 && (
+        <div className="mb-1">
+          <div className="eyebrow mb-1">Mappings</div>
+          <div className="space-y-0.5">
+            {mappingEntries.map(([id, value]) => (
+              <div key={id} className="flex gap-2 text-[11px] leading-tight">
+                <span className="text-gray-500" style={{ minWidth: 90 }}>{systemen[id]?.naam ?? id}</span>
+                <span className="font-mono" style={{ color: 'rgba(255,255,255,0.85)' }}>{value || '—'}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {veld.opmerkingen && (
+        <div className="mt-2 pt-2 border-t border-gray-200 text-[11px] italic leading-snug" style={{ color: 'var(--orange)' }}>
+          <span className="eyebrow mr-1" style={{ color: 'var(--orange)' }}>note</span>
+          <span style={{ color: 'rgba(255,255,255,0.75)' }}>{veld.opmerkingen}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CdmTreeNode({ veld, subObjecten, depth, parentKey, onHover, systemen }) {
+  const sub = findSubObject(subObjecten, veld.type);
+  const [open, setOpen] = useState(false);
+  const key = parentKey + '/' + veld.naam;
+  const handleEnter = (e) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    onHover(veld, rect);
+  };
+  return (
+    <>
+      <div
+        className={\`tree-row \${sub ? 'expandable' : ''}\`}
+        style={{ paddingLeft: depth * 14 + 4 }}
+        onClick={() => sub && setOpen(!open)}
+        onMouseEnter={handleEnter}
+        onMouseLeave={() => onHover(null, null)}
+      >
+        <span className={\`tree-chev \${sub ? '' : 'empty'}\`}>{sub ? (open ? '▾' : '▸') : '·'}</span>
+        <span className="font-mono text-xs" style={{ color: 'var(--navy)' }}>{veld.naam}</span>
+        <span className="font-mono text-[10px] text-gray-500">{veld.type}</span>
+        <span style={{ flex: 1 }} />
+        {veld.eigenaar && <EigenaarPill eigenaar={veld.eigenaar} systemen={systemen} />}
+      </div>
+      {open && sub && sub.velden.map((c) => (
+        <CdmTreeNode key={c.naam} veld={c} subObjecten={subObjecten} depth={depth + 1} parentKey={key} onHover={onHover} systemen={systemen} />
+      ))}
+    </>
+  );
+}
+
+function CdmTree({ velden, subObjecten, systemen }) {
+  const [hovered, setHovered] = useState(null);
+  const onHover = (veld, rect) => {
+    if (!veld) { setHovered(null); return; }
+    const tooltipWidth = 340;
+    const margin = 8;
+    let left = rect.right + margin;
+    if (left + tooltipWidth > window.innerWidth - margin) {
+      left = Math.max(margin, rect.left - tooltipWidth - margin);
+    }
+    let top = rect.top;
+    const tooltipMaxHeight = Math.min(window.innerHeight - 20, 480);
+    if (top + tooltipMaxHeight > window.innerHeight - margin) {
+      top = Math.max(margin, window.innerHeight - tooltipMaxHeight - margin);
+    }
+    setHovered({ veld, position: { top, left } });
+  };
+  const orphans = findOrphanSubObjects(velden, subObjecten);
+  return (
+    <div className="cdm-tree">
+      {velden.map((v) => (
+        <CdmTreeNode key={v.naam} veld={v} subObjecten={subObjecten} depth={0} parentKey="" onHover={onHover} systemen={systemen} />
+      ))}
+      {orphans.map((sub) => (
+        <div key={sub.naam} className="mt-4 pt-3 border-t border-gray-200">
+          <div className="eyebrow mb-2" style={{ color: 'var(--orange)' }}>{sub.naam}</div>
+          {sub.velden.map((v) => (
+            <CdmTreeNode key={sub.naam + '/' + v.naam} veld={v} subObjecten={subObjecten} depth={0} parentKey={sub.naam} onHover={onHover} systemen={systemen} />
+          ))}
+        </div>
+      ))}
+      {hovered && <CdmFieldTooltip veld={hovered.veld} systemen={systemen} position={hovered.position} />}
+    </div>
+  );
+}
+
+function flattenCdmVelden(velden, subObjecten, expanded, depth = 0, parentKey = '') {
+  const out = [];
+  for (const v of velden) {
+    const key = parentKey + '/' + v.naam;
+    const sub = findSubObject(subObjecten, v.type);
+    out.push({ veld: v, depth, key, sub, open: expanded.has(key) });
+    if (sub && expanded.has(key)) {
+      out.push(...flattenCdmVelden(sub.velden, subObjecten, expanded, depth + 1, key));
+    }
+  }
+  return out;
+}
+
+function CdmTableRow({ entry, index, toggle, systeemIds, systemen, toonEigenaar, colSpan }) {
+  const { veld, depth, key, sub, open } = entry;
+  const indent = depth * 18 + 8;
+  const stripeClass = index % 2 === 1 ? 'cdm-row-alt' : '';
+  return (
+    <>
+      <tr className={\`\${stripeClass} \${veld.opmerkingen ? '' : 'border-b border-gray-100'}\`}>
+        <td className="py-2 px-2 font-mono text-xs whitespace-nowrap" style={{ color: 'var(--navy)', paddingLeft: indent }}>
+          {sub ? (
+            <button
+              onClick={() => toggle(key)}
+              style={{ background: 'transparent', border: 0, color: 'var(--orange)', cursor: 'pointer', marginRight: 4, padding: 0, fontSize: 10, width: 12 }}
+            >
+              {open ? '▾' : '▸'}
+            </button>
+          ) : (
+            <span style={{ display: 'inline-block', width: 16 }} />
+          )}
+          {veld.naam}
+        </td>
+        <td className="py-2 px-2 font-mono text-xs text-gray-600 whitespace-nowrap">{veld.type}</td>
+        {toonEigenaar && (
+          <td className="py-2 px-2 text-xs whitespace-nowrap">
+            {veld.eigenaar
+              ? <EigenaarPill eigenaar={veld.eigenaar} systemen={systemen} />
+              : <span className="text-gray-300">—</span>}
+          </td>
+        )}
+        <td className="py-2 px-2 text-gray-700">{veld.verplicht ? '✓' : ''}</td>
+        <td className="py-2 px-2 text-gray-700 leading-snug">{veld.beschrijving}</td>
+        {systeemIds.map((id) => (
+          <td key={id} className="py-2 px-2 font-mono text-[11px] text-gray-600 whitespace-nowrap">
+            {veld.mapping[id] || <span className="text-gray-300">—</span>}
+          </td>
+        ))}
+      </tr>
+      {veld.opmerkingen && (
+        <tr className={\`\${stripeClass} border-b border-gray-100\`}>
+          <td colSpan={colSpan} className="pb-2 text-[11px] italic leading-snug" style={{ color: 'var(--orange)', paddingLeft: indent + 16, paddingRight: 8 }}>
+            <span className="eyebrow mr-2" style={{ color: 'var(--orange)' }}>note</span>
+            <span style={{ color: 'rgba(255,255,255,0.7)' }}>{veld.opmerkingen}</span>
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+function CdmTabel({ velden, subObjecten, systeemIds, systemen }) {
+  const toonEigenaar =
+    velden.some((v) => v.eigenaar) ||
+    subObjecten.some((s) => s.velden.some((v) => v.eigenaar));
+  const colSpan = 4 + (toonEigenaar ? 1 : 0) + systeemIds.length;
+  const [expanded, setExpanded] = useState(() => new Set());
+  const toggle = (key) => setExpanded((prev) => {
+    const next = new Set(prev);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    return next;
+  });
+  const flat = flattenCdmVelden(velden, subObjecten, expanded);
+  const orphans = findOrphanSubObjects(velden, subObjecten);
+  return (
+    <div>
+      <table className="text-sm border-collapse" style={{ minWidth: '100%' }}>
+        <thead>
+          <tr className="border-b-2" style={{ borderColor: 'var(--navy)' }}>
+            <th className="text-left py-2 px-2 eyebrow">Veld</th>
+            <th className="text-left py-2 px-2 eyebrow">Type</th>
+            {toonEigenaar && <th className="text-left py-2 px-2 eyebrow">Eigenaar</th>}
+            <th className="text-left py-2 px-2 eyebrow">Verpl.</th>
+            <th className="text-left py-2 px-2 eyebrow">Beschrijving</th>
+            {systeemIds.map((id) => (
+              <th key={id} className="text-left py-2 px-2 eyebrow whitespace-nowrap">
+                {systemen[id]?.naam ?? id}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {flat.map((entry, i) => (
+            <CdmTableRow
+              key={entry.key}
+              entry={entry}
+              index={i}
+              toggle={toggle}
+              systeemIds={systeemIds}
+              systemen={systemen}
+              toonEigenaar={toonEigenaar}
+              colSpan={colSpan}
+            />
+          ))}
+        </tbody>
+      </table>
+      {orphans.map((sub) => {
+        const orphanFlat = sub.velden.map((v) => ({ veld: v, depth: 0, key: sub.naam + '/' + v.naam, sub: null, open: false }));
+        return (
+          <div key={sub.naam} className="mt-6">
+            <h4 className="text-base font-semibold mb-2" style={{ color: 'var(--orange)' }}>{sub.naam}</h4>
+            <table className="text-sm border-collapse" style={{ minWidth: '100%' }}>
+              <thead>
+                <tr className="border-b-2" style={{ borderColor: 'var(--navy)' }}>
+                  <th className="text-left py-2 px-2 eyebrow">Veld</th>
+                  <th className="text-left py-2 px-2 eyebrow">Type</th>
+                  {toonEigenaar && <th className="text-left py-2 px-2 eyebrow">Eigenaar</th>}
+                  <th className="text-left py-2 px-2 eyebrow">Verpl.</th>
+                  <th className="text-left py-2 px-2 eyebrow">Beschrijving</th>
+                  {systeemIds.map((id) => (
+                    <th key={id} className="text-left py-2 px-2 eyebrow whitespace-nowrap">{systemen[id]?.naam ?? id}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {orphanFlat.map((entry, i) => (
+                  <CdmTableRow
+                    key={entry.key}
+                    entry={entry}
+                    index={i}
+                    toggle={toggle}
+                    systeemIds={systeemIds}
+                    systemen={systemen}
+                    toonEigenaar={toonEigenaar}
+                    colSpan={colSpan}
+                  />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function CdmPanel({ cdm, systemen, onPopout, compact }) {
+  const systeemIds = useMemo(() => {
+    const s = new Set();
+    cdm.velden.forEach((v) => Object.keys(v.mapping).forEach((id) => s.add(id)));
+    cdm.subObjecten.forEach((sub) => sub.velden.forEach((v) => Object.keys(v.mapping).forEach((id) => s.add(id))));
+    return [...s];
+  }, [cdm]);
+
+  return (
+    <div>
+      <div className="flex items-center gap-3 mb-2 flex-wrap">
+        <h3 className="text-xl font-semibold capitalize" style={{ color: 'var(--navy)' }}>{cdm.domein} API</h3>
+        <Pill variant="orange">v{cdm.versie}</Pill>
+        <StatusPill status={cdm.status} />
+        {onPopout && (
+          <button className="popout-trigger ml-auto" onClick={onPopout} title="Open CDM in volledige breedte">
+            ⤢ Popout
+          </button>
+        )}
+      </div>
+      <p className="text-sm text-gray-600 italic mb-5 leading-snug">{cdm.beschrijving}</p>
+      {compact
+        ? <CdmTree velden={cdm.velden} subObjecten={cdm.subObjecten} systemen={systemen} />
+        : <CdmTabel velden={cdm.velden} subObjecten={cdm.subObjecten} systeemIds={systeemIds} systemen={systemen} />
+      }
+    </div>
+  );
+}
+
+function WorkatoSync({ topic, systemen, workato }) {
+  if (!workato) return null;
+  const entry = workato.topics?.[topic.naam];
+
+  const recipeLink = (id) => \`\${workato.baseUrl}/recipes/\${id}\`;
+  const checkedAt = workato.checkedAt ? new Date(workato.checkedAt).toLocaleString('nl-NL') : null;
+
+  if (!entry) {
+    return (
+      <div className="mb-6 pt-4 border-t border-gray-200">
+        <div className="flex items-baseline gap-2 mb-2">
+          <div className="eyebrow">Workato sync</div>
+          {checkedAt && <span className="text-[10px] text-gray-500">· {checkedAt}</span>}
+        </div>
+        <div className="text-xs text-gray-500 italic">Geen pub/sub-koppeling gevonden in Workato voor dit topic.</div>
+      </div>
+    );
+  }
+
+  const verwachteBron = new Set(topic.bron);
+  const verwachteCons = new Set(topic.consumers);
+  const wkPubs = new Set(entry.publishers.map((p) => p.systeemId));
+  const wkSubs = new Set(entry.subscribers.map((s) => s.systeemId));
+
+  const issues = [];
+  for (const b of verwachteBron) if (!wkPubs.has(b)) issues.push(\`bron \${b} niet in Workato\`);
+  for (const p of wkPubs) if (!verwachteBron.has(p)) issues.push(\`onverwachte bron in Workato: \${p}\`);
+  for (const c of verwachteCons) if (!wkSubs.has(c)) issues.push(\`consumer \${c} niet in Workato\`);
+  for (const c of wkSubs) if (!verwachteCons.has(c)) issues.push(\`onverwachte consumer in Workato: \${c}\`);
+
+  const renderRol = (lijst, verwacht) => (
+    <div className="space-y-2">
+      {lijst.length === 0
+        ? <div className="text-xs text-gray-500 italic">(geen)</div>
+        : lijst.map((entry) => {
+            const onverwacht = !verwacht.has(entry.systeemId);
+            return (
+              <div key={entry.systeemId}>
+                <div className="flex items-center gap-2">
+                  {systemen[entry.systeemId]
+                    ? <SysteemLabel systeem={systemen[entry.systeemId]} className="text-sm font-medium" style={{ color: onverwacht ? 'var(--orange)' : 'var(--navy)' }} />
+                    : <span className="text-sm font-medium" style={{ color: 'var(--orange)' }}>{entry.systeemId}</span>
+                  }
+                  {onverwacht && <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--orange)' }}>onverwacht</span>}
+                </div>
+                <div className="text-[11px] text-gray-500 mt-0.5 space-y-0.5">
+                  {entry.recipes.map((r) => (
+                    <div key={r.id} className="flex gap-2 leading-tight">
+                      <a href={recipeLink(r.id)} target="_blank" rel="noreferrer" className="font-mono hover:underline flex-shrink-0" style={{ color: 'var(--orange)' }}>
+                        #{r.id}
+                      </a>
+                      <span>{r.name}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+    </div>
+  );
+
+  return (
+    <div className="mb-6 pt-4 border-t border-gray-200">
+      <div className="flex items-baseline gap-2 mb-3">
+        <div className="eyebrow">Workato sync · topic #{entry.workatoId}</div>
+        {checkedAt && <span className="text-[10px] text-gray-500">· {checkedAt}</span>}
+      </div>
+
+      {issues.length > 0 && (
+        <ul className="mb-3 space-y-1">
+          {issues.map((i, idx) => (
+            <li key={idx} className="text-xs flex gap-2" style={{ color: 'var(--orange)' }}>
+              <span>⚠</span><span>{i}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {issues.length === 0 && (
+        <div className="mb-3 text-xs" style={{ color: '#4ade80' }}>✓ Git en Workato in sync.</div>
+      )}
+
+      <div className="grid grid-cols-2 gap-4">
+        <div>
+          <div className="eyebrow mb-2">Publishers</div>
+          {renderRol(entry.publishers, verwachteBron)}
+        </div>
+        <div>
+          <div className="eyebrow mb-2">Subscribers</div>
+          {renderRol(entry.subscribers, verwachteCons)}
+        </div>
+      </div>
+
+      {entry.ambiguousRecipes.length > 0 && (
+        <div className="mt-3 pt-3 border-t border-gray-200">
+          <div className="eyebrow mb-2">Ambigue recipes</div>
+          <ul className="space-y-1">
+            {entry.ambiguousRecipes.map((r) => (
+              <li key={r.id + r.rol} className="text-[11px]">
+                <a href={recipeLink(r.id)} target="_blank" rel="noreferrer" className="font-mono mr-2" style={{ color: 'var(--orange)' }}>#{r.id}</a>
+                <span className="text-gray-600">{r.name}</span>
+                <span className="ml-2 text-gray-500">[{r.rol}]</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TopicDetail({ api, topic, systemen, workato }) {
+  return (
+    <div>
+      <div className="eyebrow mb-1">Topic · {api.label} API</div>
+      <div className="flex items-center gap-3 mb-4">
+        <h2 className="text-2xl font-semibold" style={{ color: 'var(--navy)' }}>{topic.naam}</h2>
+        <StatusPill status={topic.status} />
+      </div>
+
+      <div className="grid grid-cols-2 gap-4 mb-6">
+        <div>
+          <div className="eyebrow mb-2">{topic.bron.length > 1 ? 'Bronnen' : 'Bron'}</div>
+          {topic.bron.map((b) => (
+            <div key={b}>
+              <SysteemLabel systeem={systemen[b]} className="text-sm font-medium" style={{ color: 'var(--navy)' }} />
+              <div className="text-xs text-gray-500 mt-0.5 mb-1">{systemen[b].beschrijving}</div>
+            </div>
+          ))}
+        </div>
+        <div>
+          <div className="eyebrow mb-2">Consumers</div>
+          {topic.consumers.map((c) => (
+            <div key={c}>
+              <SysteemLabel systeem={systemen[c]} className="text-sm font-medium" style={{ color: 'var(--navy)' }} />
+              <div className="text-xs text-gray-500 mt-0.5 mb-1">{systemen[c].beschrijving}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="mb-6">
+        <div className="eyebrow mb-2">Triggers</div>
+        <ul className="space-y-1.5">
+          {topic.triggers.map((tr, i) => (
+            <li key={i} className="flex items-start gap-2 text-sm text-gray-800">
+              <span className="font-mono text-[11px] text-gray-400 mt-1">{String(i + 1).padStart(2, '0')}</span>
+              <span>{tr}</span>
+            </li>
+          ))}
+        </ul>
+      </div>
+
+      <div className="mb-6">
+        <div className="eyebrow mb-2">Fallback</div>
+        <p className="text-sm text-gray-700 italic leading-snug border-l-2 pl-3" style={{ borderColor: 'var(--orange)' }}>
+          {topic.fallback}
+        </p>
+      </div>
+
+      <WorkatoSync topic={topic} systemen={systemen} workato={workato} />
+    </div>
+  );
+}
+
+function ApiDetail({ api, systemen, cdm, onPopout }) {
+  const bronnen = [...new Set(api.topics.flatMap((t) => t.bron))];
+  const consumers = [...new Set(api.topics.flatMap((t) => t.consumers))];
+  const cdmDoc = cdm[api.cdm];
+
+  return (
+    <div>
+      <div className="eyebrow mb-1">API</div>
+      <div className="flex items-center gap-3 mb-4">
+        <h2 className="text-2xl font-semibold" style={{ color: 'var(--navy)' }}>{api.label} API</h2>
+        <StatusPill status={api.status} />
+      </div>
+
+      <div className="grid grid-cols-2 gap-4 mb-6">
+        <div>
+          <div className="eyebrow mb-2">Bronnen</div>
+          <div className="space-y-1">
+            {bronnen.map((b) => (
+              <SysteemLabel key={b} systeem={systemen[b]} className="text-sm font-medium" style={{ color: 'var(--navy)', display: 'flex' }} />
+            ))}
+          </div>
+        </div>
+        <div>
+          <div className="eyebrow mb-2">Consumers</div>
+          <div className="space-y-1">
+            {consumers.map((c) => (
+              <SysteemLabel key={c} systeem={systemen[c]} className="text-sm font-medium" style={{ color: 'var(--navy)', display: 'flex' }} />
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-4 mb-6">
+        <div>
+          <div className="eyebrow mb-2">Afhankelijk van</div>
+          {api.afhankelijk_van.length === 0
+            ? <span className="text-sm text-gray-400">—</span>
+            : <div className="flex flex-wrap gap-1">{api.afhankelijk_van.map((a) => <Pill key={a}>{a}</Pill>)}</div>
+          }
+        </div>
+        <div>
+          <div className="eyebrow mb-2">Stories</div>
+          {api.gerelateerde_stories.length === 0
+            ? <span className="text-sm text-gray-400">—</span>
+            : <div className="flex flex-wrap gap-1">
+                {api.gerelateerde_stories.map((s) => (
+                  <a key={s} href={\`https://scandiagear.atlassian.net/browse/\${s}\`} target="_blank" rel="noreferrer">
+                    <Pill variant="orange">{s}</Pill>
+                  </a>
+                ))}
+              </div>
+          }
+        </div>
+      </div>
+
+      {cdmDoc && (
+        <div className="pt-6 border-t border-gray-200">
+          <div className="eyebrow mb-4">Canoniek Datamodel</div>
+          <CdmPanel cdm={cdmDoc} systemen={systemen} onPopout={onPopout} compact />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CdmPopout({ cdm, systemen, onClose }) {
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      document.body.style.overflow = prev;
+    };
+  }, [onClose]);
+  return (
+    <div className="popout-backdrop" onClick={onClose}>
+      <div className="popout-panel" onClick={(e) => e.stopPropagation()}>
+        <button className="popout-close" onClick={onClose}>✕ Sluit (esc)</button>
+        <CdmPanel cdm={cdm} systemen={systemen} />
+      </div>
+    </div>
+  );
+}
+
+function IntegratieLandkaart() {
+  const [selectedApi, setSelectedApi] = useState(LANDKAART.apis[0]);
+  const [selectedTopic, setSelectedTopic] = useState(null);
+  const [popoutCdmKey, setPopoutCdmKey] = useState(null);
+  const landkaartRef = useRef(null);
+
+  const onSelectApi = (api) => {
+    setSelectedApi(api);
+    setSelectedTopic(null);
+  };
+  const onSelectTopic = (api, topic) => {
+    setSelectedApi(api);
+    setSelectedTopic(topic);
+  };
+
+  const systeemVolgorde = useMemo(() => Object.keys(LANDKAART.systemen), []);
+  const sorteerOpVolgorde = (ids) => {
+    const set = new Set(ids);
+    return systeemVolgorde.filter((id) => set.has(id));
+  };
+  const allBronIds = useMemo(() => {
+    const s = new Set();
+    LANDKAART.apis.forEach((a) => a.topics.forEach((t) => t.bron.forEach((b) => s.add(b))));
+    return sorteerOpVolgorde(s);
+  }, []);
+  const allConsumerIds = useMemo(() => {
+    const s = new Set();
+    LANDKAART.apis.forEach((a) => a.topics.forEach((t) => t.consumers.forEach((c) => s.add(c))));
+    return sorteerOpVolgorde(s);
+  }, []);
+  const dataLeveranciers = useMemo(
+    () => Object.values(LANDKAART.systemen).filter((s) => s.type === 'data-leverancier'),
+    []
+  );
+
+  // Actieve systemen: bij topic-selectie precies die topic; anders alle topics van de API.
+  const activeBronnen = new Set();
+  const activeConsumers = new Set();
+  const topicsVoorHighlight = selectedTopic ? [selectedTopic] : (selectedApi?.topics ?? []);
+  for (const t of topicsVoorHighlight) {
+    for (const b of t.bron) activeBronnen.add(b);
+    for (const c of t.consumers) activeConsumers.add(c);
+  }
+
+  return (
+    <div className="min-h-screen" style={{ background: 'var(--gray-50)' }}>
+      <Header />
+      <div className="split">
+        {/* Landkaart links: bronnen · topics · consumers */}
+        <div className="pane-left">
+          <div className="landkaart-area" ref={landkaartRef}>
+            <div className="grid gap-4" style={{ gridTemplateColumns: '1fr 1.5fr 1fr' }}>
+              <BronnenKolom
+                systemen={LANDKAART.systemen}
+                bronIds={allBronIds}
+                dataLeveranciers={dataLeveranciers}
+                activeBronnen={activeBronnen}
+              />
+              <TopicsKolom
+                apis={LANDKAART.apis}
+                systemen={LANDKAART.systemen}
+                selectedApi={selectedApi}
+                selectedTopic={selectedTopic}
+                onSelectApi={onSelectApi}
+                onSelectTopic={onSelectTopic}
+              />
+              <ConsumersKolom
+                systemen={LANDKAART.systemen}
+                consumerIds={allConsumerIds}
+                activeConsumers={activeConsumers}
+              />
+            </div>
+            <Connectors
+              containerRef={landkaartRef}
+              topics={selectedApi?.topics ?? []}
+              selectedTopicId={selectedTopic?.id ?? null}
+              systemen={LANDKAART.systemen}
+            />
+          </div>
+        </div>
+
+        {/* Detail rechts — donker, bleed tot schermrand */}
+        <div className="pane-right">
+          <div className="sticky-detail">
+            {selectedTopic
+              ? <TopicDetail api={selectedApi} topic={selectedTopic} systemen={LANDKAART.systemen} workato={LANDKAART.workato} />
+              : selectedApi
+                ? <ApiDetail api={selectedApi} systemen={LANDKAART.systemen} cdm={LANDKAART.cdm} onPopout={() => setPopoutCdmKey(selectedApi.cdm)} />
+                : <div className="text-sm" style={{ color: 'rgba(255,255,255,0.6)' }}>Selecteer een API om details te zien.</div>
+            }
+          </div>
+        </div>
+      </div>
+
+      {popoutCdmKey && LANDKAART.cdm[popoutCdmKey] && (
+        <CdmPopout cdm={LANDKAART.cdm[popoutCdmKey]} systemen={LANDKAART.systemen} onClose={() => setPopoutCdmKey(null)} />
+      )}
+
+      <footer className="border-t border-gray-200 bg-white">
+        <div className="px-8 py-6 flex justify-between eyebrow">
+          <span>Document eigenaar · ${config.document_eigenaar}</span>
+          <span>Opgesteld met · Ciphix</span>
+          <span>Status · {LANDKAART.metadata.status} v{LANDKAART.metadata.versie}</span>
+        </div>
+      </footer>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<IntegratieLandkaart />);
+</script>
+</body>
+</html>`;
+}
+
+const lk = loadLandkaart();
+const html = genereerHtml(lk);
+
+mkdirSync(join(process.cwd(), 'output'), { recursive: true });
+const outputPath = join(process.cwd(), 'output', 'landkaart.html');
+writeFileSync(outputPath, html, 'utf8');
+
+console.log(`✓ Visuele landkaart gegenereerd: ${outputPath}`);
+console.log(`  open in browser: file://${outputPath}`);

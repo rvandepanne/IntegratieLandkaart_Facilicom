@@ -1,0 +1,59 @@
+name: Generate landkaart
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'data/**'
+      - 'scripts/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - '.github/workflows/generate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    env:
+      WORKATO_API_TOKEN: ${{ secrets.WORKATO_API_TOKEN }}
+      WORKATO_BASE_URL: ${{ secrets.WORKATO_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - run: npm run generate
+
+      - name: Validate against Workato
+        if: env.WORKATO_API_TOKEN != ''
+        run: |
+          npm run validate:workato
+          npm run generate:visual
+
+      - name: Upload landkaart als artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: landkaart
+          path: output/landkaart.html
+          retention-days: 90
+
+      - name: Commit generated output
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add output/
+          if git diff --staged --quiet; then
+            echo "No output changes"
+          else
+            git commit -m "chore: regenerate landkaart output [skip ci]"
+            git push
+          fi
